@@ -1,0 +1,118 @@
+optuna smell 
+import pandas as pd
+import numpy as np
+import optuna
+from catboost import CatBoostRegressor
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import KBinsDiscretizer
+
+# 1. LOAD & CLEAN
+train = pd.read_csv('/kaggle/input/house-prices-advanced-regression-techniques/train.csv')
+test = pd.read_csv('/kaggle/input/house-prices-advanced-regression-techniques/test.csv')
+
+# Drop documented outliers
+train = train.drop(train[(train['GrLivArea']>4000) & (train['SalePrice']<300000)].index)
+
+y = np.log1p(train['SalePrice'])
+X = train.drop(['SalePrice', 'Id'], axis=1)
+X_test = test.drop(['Id'], axis=1)
+
+# 2. YOUR ORIGINAL FEATURE ENGINEERING BLOCKS
+def apply_domain_engineering(df):
+    X = df.copy()
+    
+    # Fill calculation NaNs
+    calc_cols = ['1stFlrSF', '2ndFlrSF', 'TotalBsmtSF', 'FullBath', 'HalfBath', 
+                 'BsmtFullBath', 'BsmtHalfBath', 'BedroomAbvGr', 'KitchenAbvGr']
+    for col in calc_cols:
+        X[col] = X[col].fillna(0)
+
+    # BLOCK 1: THE PHYSICAL RATIO BLOCK
+    X['TotalSF'] = X['TotalBsmtSF'] + X['1stFlrSF'] + X['2ndFlrSF']
+    X['Total_Bathrooms'] = X['FullBath'] + (0.5 * X['HalfBath']) + X['BsmtFullBath'] + (0.5 * X['BsmtHalfBath'])
+    X['Qual_Density'] = X['TotalSF'] * X['OverallQual']
+    X['Age_at_Sale'] = X['YrSold'] - X['YearBuilt']
+    X['Years_Since_Remod'] = X['YrSold'] - X['YearRemodAdd']
+    
+    # BLOCK 2: LUXURY FEATURES
+    X['HasPool'] = X['PoolArea'].apply(lambda x: 1 if x > 0 else 0)
+    X['Has2ndFlr'] = X['2ndFlrSF'].apply(lambda x: 1 if x > 0 else 0)
+    X['HasGarage'] = X['GarageArea'].apply(lambda x: 1 if x > 0 else 0)
+    
+    # BLOCK 3: ORDINAL MAPPING
+    qual_map = {'Ex': 5, 'Gd': 4, 'TA': 3, 'Fa': 2, 'Po': 1, 'None': 0}
+    qual_cols = ['ExterQual', 'ExterCond', 'BsmtQual', 'BsmtCond', 'HeatingQC', 'KitchenQual', 'FireplaceQu', 'GarageQual', 'GarageCond']
+    for col in qual_cols:
+        if col in X.columns:
+            X[col] = X[col].fillna('None').map(qual_map).astype(float)
+
+    # Categorical Consistency
+    cat_cols = X.select_dtypes(include=['object']).columns
+    for col in cat_cols:
+        X[col] = X[col].fillna('None').astype(str)
+        
+    return X
+
+X = apply_domain_engineering(X)
+X_test = apply_domain_engineering(X_test)
+cat_features = list(X.select_dtypes(include=['object']).columns)
+
+# 3. BAYESIAN OPTIMIZATION SETUP
+def objective(trial):
+    # Search space for CatBoost
+    params = {
+        "iterations": 2000,
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+        "depth": trial.suggest_int("depth", 4, 8),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+        "random_strength": trial.suggest_float("random_strength", 0.1, 1.0),
+        "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        "border_count": 254,
+        "loss_function": "RMSE",
+        "verbose": False,
+        "random_seed": 42
+    }
+
+    # Cross-validation within the Bayesian trial
+    kb = KBinsDiscretizer(n_bins=10, encode='ordinal', strategy='quantile')
+    y_binned = kb.fit_transform(y.values.reshape(-1, 1)).flatten()
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    cv_scores = []
+    for t_idx, v_idx in skf.split(X, y_binned):
+        xt, xv = X.iloc[t_idx], X.iloc[v_idx]
+        yt, yv = y.iloc[t_idx], y.iloc[v_idx]
+        
+        model = CatBoostRegressor(**params)
+        model.fit(xt, yt, eval_set=(xv, yv), cat_features=cat_features, early_stopping_rounds=100)
+        
+        preds = model.predict(xv)
+        rmse = np.sqrt(mean_squared_error(yv, preds))
+        cv_scores.append(rmse)
+        
+    return np.mean(cv_scores)
+
+# 4. RUN OPTIMIZATION
+print("Starting Bayesian Study...")
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=20) # Increase n_trials for better accuracy
+
+print(f"Best CV RMSE: {study.best_value}")
+print(f"Best Params: {study.best_params}")
+
+# 5. FINAL TRAIN & SUBMIT
+best_params = study.best_params
+best_params['iterations'] = 3000 # Increase for final run
+final_model = CatBoostRegressor(**best_params, verbose=0)
+final_model.fit(X, y, cat_features=cat_features)
+
+submission = pd.DataFrame({
+    "Id": test['Id'],
+    "SalePrice": np.expm1(final_model.predict(X_test))
+})
+submission.to_csv("submission.csv", index=False)
+print("Submission complete.")
+
+
+Best Params: {'learning_rate': 0.01989059723454135, 'depth': 6, 'l2_leaf_reg': 2.974324790258522, 'random_strength': 0.9256885326760473, 'bagging_temperature': 0.615602553290312}
